@@ -1,0 +1,24 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+matching-engine
+
+# Test binaries
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Data & WAL files
+data/
+*.wal
+
+# IDE and OS artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
