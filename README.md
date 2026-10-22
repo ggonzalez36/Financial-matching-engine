@@ -1,12 +1,15 @@
-# High-Performance In-Memory Financial Order Matching Engine (LOB)
+# In-Memory Order Matching Engine (Limit Order Book) in Go
 
 [![Go Version](https://img.shields.io/badge/Go-1.23%2B-00ADD8?style=flat&logo=go)](https://golang.org)
-[![Architecture](https://img.shields.io/badge/Architecture-Single--Writer%20Actor%20%2F%20LMAX-orange)](#system-architecture)
-[![Throughput](https://img.shields.io/badge/Throughput-8M%20ops%2Fsec-brightgreen)](#benchmarks--performance)
-[![Latency](https://img.shields.io/badge/Latency-~98ns%20Crossing%20Match-blue)](#benchmarks--performance)
-[![Allocations](https://img.shields.io/badge/Allocations-0%20B%2Fop%20(Zero--Alloc)-success)](#memory-layout--cache-line-packing)
+[![Architecture](https://img.shields.io/badge/Architecture-Single--Writer%20per%20Symbol-orange)](#data-flow-pipeline-architecture)
+[![Persistence](https://img.shields.io/badge/Persistence-Binary%20WAL%20%2B%20CRC32-blue)](#persistence-binary-write-ahead-log-wal--recovery)
 
-An institutional-grade, deterministic, ultra-low-latency **In-Memory Limit Order Book (LOB) Matching Engine** written in Go. Designed following modern High-Frequency Trading (HFT) and mechanical sympathy principles (LMAX Disruptor pattern, cache-line alignment, zero-allocation memory recycling, intrusive FIFO doubly linked lists, and binary Write-Ahead Logging).
+A deterministic **in-memory Limit Order Book (LOB) matching engine** written in Go. It implements price-time priority with a red-black tree of price levels and intrusive FIFO lists, a single-writer goroutine per symbol fed by buffered channels, `sync.Pool` object recycling, a binary write-ahead log with CRC32 replay, and a small REST / WebSocket / SSE gateway. The design borrows ideas from low-latency trading systems (mechanical sympathy, single-writer principle) and is meant as a study of data structures and concurrency in Go.
+
+> **Scope:** personal learning project with synthetic orders; it is not connected to any market and is not used in production.
+> - **Implemented:** order book with limit/market orders and GTC/IOC/FOK, red-black tree price index with cached best bid/ask, intrusive doubly linked FIFO levels, O(1) cancel via an order index, 64-byte `Order` struct with a compile-time size check, `sync.Pool` recycling, per-symbol worker goroutines, binary WAL (orders, cancels, trades) with CRC32 and startup replay, REST + hand-written RFC 6455 WebSocket push + SSE + pprof, 6 unit tests and 3 benchmarks, and a 1M-order stress program.
+> - **Not implemented / planned:** a gRPC server (only the [`proto/engine.proto`](proto/engine.proto) contract exists; there is no generated code or gRPC dependency), downstream clearing/settlement, CI, WAL corruption/truncation tests, and published benchmark results with hardware details.
+> - **Performance:** no benchmark results are published. Run the commands in [Benchmarks](#benchmarks--performance) to measure on your own hardware.
 
 ---
 
@@ -25,13 +28,13 @@ An institutional-grade, deterministic, ultra-low-latency **In-Memory Limit Order
 
 ## Key Architectural Highlights
 
-- **Mechanical Sympathy & Cache-Line Alignment**: The `Order` struct is packed strictly down to **64 bytes**—matching the exact L1 data cache line of modern x86_64 / ARM64 CPUs. Compile-time assertions prevent cache-line splits.
-- **Zero-Allocation Hot Path**: Hot-path order execution achieves **0 B/op and 0 allocs/op** through aggressive object recycling using `sync.Pool` for orders, price levels, trades, and execution reports.
-- **Single-Writer Actor Model (Zero Mutex Contention)**: Each trading symbol (`BTC-USDT`, `ETH-USDT`) is managed by an isolated single-writer event loop goroutine fed by bounded, non-blocking channels. No global `sync.RWMutex` locks on the matching path, eliminating CPU cache-line bouncing (MESI cache invalidations) and context switches.
+- **Cache-Line-Sized Orders**: The `Order` struct is packed to exactly **64 bytes**, the common L1 cache-line size on x86_64 / ARM64. Compile-time assertions fail the build if the size drifts.
+- **Allocation-Conscious Hot Path**: Orders, price levels, tree nodes, trades and execution reports are recycled with `sync.Pool`. The crossing-match benchmark is designed to run without heap allocations; resting new orders still allocates (map insertion, new levels). Use `-benchmem` to check.
+- **Single-Writer per Symbol**: Each trading symbol (`BTC-USDT`, `ETH-USDT`, `SOL-USDT`) is owned by one event-loop goroutine fed by a bounded, non-blocking channel. The order book itself needs no mutex; the dispatcher only takes a read lock to look up the symbol's worker. This is the single-writer principle popularized by LMAX, implemented with Go channels rather than a ring buffer.
 - **Price-Time Priority (FIFO)**:
-  - **Price Levels**: Indexed via a memory-pooled **Red-Black Tree** providing $O(\log N)$ worst-case insertion/deletion and cached $O(1)$ best-bid/best-ask pointers.
-  - **Orders within a Level**: Managed via an **Intrusive Doubly Linked List** (`*Prev` and `*Next` pointers embedded directly in `Order`). Yields $O(1)$ FIFO execution and $O(1)$ arbitrary cancellations without node allocation overhead.
-- **Binary Write-Ahead Log (WAL)**: Append-only disk logging with Little-Endian compact framing, userspace buffering (`bufio`), and CRC32-IEEE checksums for crash resilience and deterministic state replay.
+  - **Price Levels**: Indexed via a pooled **Red-Black Tree** with $O(\log N)$ insertion/deletion and cached $O(1)$ best-bid/best-ask pointers.
+  - **Orders within a Level**: An **intrusive doubly linked list** (`Prev`/`Next` pointers embedded in `Order`), giving $O(1)$ FIFO execution and $O(1)$ cancellation without wrapper nodes.
+- **Binary Write-Ahead Log (WAL)**: Append-only log with little-endian framing, `bufio` buffering and CRC32-IEEE checksums, replayed at startup to rebuild the book.
 
 ---
 
@@ -41,14 +44,15 @@ An institutional-grade, deterministic, ultra-low-latency **In-Memory Limit Order
 flowchart TD
     subgraph Ingress ["1. Ingress & Gateway Layer"]
         A1[Client / Trading Bots] -->|HTTP POST| G1[REST Handler]
-        A2[WebSocket Clients] <-->|Bidirectional| G2[RFC-6455 Gateway]
-        A3[gRPC Clients] -->|Protobuf| G3[MatchingEngineService]
+        A2[WebSocket Clients] <-->|RFC 6455 push| G2[WebSocket Gateway]
+        A3["gRPC Clients (planned)"] -.->|Protobuf| G3["MatchingEngineService (contract only)"]
     end
 
-    subgraph Dispatcher ["2. Sharded Dispatcher Layer"]
-        G1 & G2 & G3 --> D[EngineDispatcher]
-        D -->|Hash / Route by Symbol| Q1["Inbound Channel (BTC-USDT)<br/>Ring Buffer (64K Depth)"]
-        D -->|Hash / Route by Symbol| Q2["Inbound Channel (ETH-USDT)<br/>Ring Buffer (64K Depth)"]
+    subgraph Dispatcher ["2. Dispatcher Layer"]
+        G1 --> D[EngineDispatcher]
+        G3 -.-> D
+        D -->|Route by Symbol| Q1["Inbound Channel (BTC-USDT)<br/>Buffered, 64K capacity"]
+        D -->|Route by Symbol| Q2["Inbound Channel (ETH-USDT)<br/>Buffered, 64K capacity"]
     end
 
     subgraph CoreEngine ["3. Single-Writer Matching Loop (Per Symbol Worker)"]
@@ -58,11 +62,11 @@ flowchart TD
         LOB -->|Generate Matches| ER[ExecutionReport]
     end
 
-    subgraph Egress ["4. Event Outbox & Market Data Broadcast"]
+    subgraph Egress ["4. Outbox & Market Data Broadcast"]
         ER -->|Log Executed Trades| WAL
         ER -->|Dispatch| OUT[Outbox Channel]
-        OUT --> WS_BROADCAST["WebSocket / SSE Streamer<br/>(Real-Time L2 Book & Trades)"]
-        OUT --> AUDIT["Downstream Clearing / Settlement"]
+        OUT --> WS_BROADCAST["WebSocket / SSE Streamer<br/>(Trades)"]
+        OUT -.-> AUDIT["Downstream Clearing / Settlement (planned)"]
     end
 ```
 
@@ -70,7 +74,7 @@ flowchart TD
 
 ## Memory Layout & Cache-Line Packing
 
-In low-latency systems, struct layout directly governs CPU memory bus efficiency. Memory is fetched in 64-byte chunks (Cache Lines). A poorly aligned struct spanning across two cache lines incurs a 2x latency penalty for every read/write.
+CPUs fetch memory in cache lines (typically 64 bytes). A struct that straddles two cache lines can require two fetches per access, so the hot `Order` struct is laid out to fit exactly one line.
 
 ### Packed `Order` Struct (Exactly 64 Bytes)
 
@@ -95,8 +99,10 @@ const _ = uint(64 - unsafe.Sizeof(Order{}))
 const _ = uint(unsafe.Sizeof(Order{}) - 64)
 ```
 
-### Eliminating Floating-Point Inaccuracies
-Prices and quantities are modeled using **fixed-point integers (`uint64`)** representing base micro-units ($10^{-4}$ or $10^{-6}$). This eliminates IEEE-754 rounding artifacts and allows the CPU arithmetic logic unit (ALU) to execute comparisons in a single clock cycle.
+Note: the size check guarantees 64 bytes, but Go does not guarantee 64-byte *alignment* of heap objects, so an order may still start mid-line.
+
+### Avoiding Floating-Point Errors
+Prices and quantities are fixed-point integers (`uint64`) in minor units. This avoids IEEE-754 rounding issues and keeps comparisons as plain integer operations.
 
 ---
 
@@ -112,30 +118,32 @@ Prices and quantities are modeled using **fixed-point integers (`uint64`)** repr
 ### Data Structures Map:
 | Component | Data Structure | Lookup | Insertion | Removal / Cancel | Rationale |
 | :--- | :--- | :---: | :---: | :---: | :--- |
-| **Price Levels** | Red-Black Tree (`rbTree`) | $O(\log N)$ | $O(\log N)$ | $O(\log N)$ | Self-balancing tree guarantees upper-bound latency for sparse orders. |
-| **Top of Book** | Cached Pointers (`bestBid`, `bestAsk`) | **$O(1)$** | $O(1)$ | $O(1)$ amortized | Instant access to market spread without tree traversal. |
+| **Price Levels** | Red-Black Tree (`rbTree`) | $O(\log N)$ | $O(\log N)$ | $O(\log N)$ | Self-balancing tree bounds the worst case for sparse books. |
+| **Top of Book** | Cached Pointers (`bestBid`, `bestAsk`) | **$O(1)$** | $O(1)$ | $O(1)$ amortized | Access to the spread without tree traversal. |
 | **Orders in Level** | Intrusive Doubly Linked List | $O(1)$ (Head) | **$O(1)$** (Tail) | **$O(1)$** (Any) | Intrusive pointers avoid wrapper allocations (`list.Element`). |
-| **Order Index** | Direct Hash Map (`map[OrderID]*Order`) | **$O(1)$** | $O(1)$ | $O(1)$ | Instant order lookup for user cancellations and amendments. |
+| **Order Index** | Hash Map (`map[OrderID]*Order`) | **$O(1)$** | $O(1)$ | $O(1)$ | Direct order lookup for cancellations. |
 
 ---
 
 ## Persistence: Binary Write-Ahead Log (WAL) & Recovery
 
-To withstand sudden process failure or power interruption without losing exchange state, every order entry and cancellation is serialized into an append-only binary log.
+Every new order, cancellation and executed trade is serialized into an append-only binary log so the book can be rebuilt after a restart.
 
 ### Binary Framing Format (9-byte Header + Little-Endian Payload):
 ```
 +---------------+-------------+-------------------+--------------------+----------------------+
 | Magic (2B)    | Type (1B)   | Payload Length(2B)| CRC32 Checksum(4B) | Binary Payload (NB)  |
-| 0x5741 ("WA") | 0x01 / 0x02 | uint16            | IEEE 802.3         | Struct bytes         |
+| 0x5741 ("WA") | 0x01 - 0x03 | uint16            | IEEE 802.3         | Struct bytes         |
 +---------------+-------------+-------------------+--------------------+----------------------+
 ```
 
 ### Deterministic Replay & Recovery
-Upon system startup, `engine.RecoverOrderBook(symbol, walPath)`:
-1. Sequentially streams records from offset 0 to EOF.
-2. Re-computes CRC32 checksums to detect partially written/torn pages.
-3. Replays state transitions into the in-memory book deterministically, restoring identical depth and order queues.
+On startup, `engine.RecoverOrderBook(symbol, walPath)`:
+1. Streams records sequentially from offset 0 to EOF.
+2. Re-computes CRC32 checksums to detect torn or partially written records.
+3. Replays the state transitions into the in-memory book.
+
+Durability trade-off: the server opens the WAL with buffered writes and without `fsync` on every append, so records still in the buffer can be lost on a crash or power failure. Append errors are currently not surfaced to the caller.
 
 ---
 
@@ -147,45 +155,37 @@ Upon system startup, `engine.RecoverOrderBook(symbol, walPath)`:
 - `GET /api/v1/depth?symbol=BTC-USDT&limit=10`: Retrieve current Level-2 order book depth.
 
 ### 2. WebSocket & SSE Real-Time Streaming
-- `GET /ws/stream`: RFC-6455 compliant WebSocket stream broadcasting trade execution notifications and order events.
-- `GET /events`: Zero-dependency Server-Sent Events (SSE) feed.
+- `GET /ws/stream`: WebSocket stream (RFC 6455 handshake and framing implemented by hand with the standard library) that pushes trade executions.
+- `GET /events`: Server-Sent Events (SSE) feed with no external dependencies.
 
-### 3. gRPC Contract
-A production protobuf contract is provided under [`proto/engine.proto`](file:///c:/Users/User/Documents/Engiennering/Finacial-m,atching-engine/proto/engine.proto) defining `MatchingEngineService` for ultra-fast binary RPC and streaming between internal exchange microservices.
+### 3. gRPC Contract (server planned)
+A protobuf contract is provided in [`proto/engine.proto`](proto/engine.proto), defining a `MatchingEngineService`. The gRPC server is **not implemented yet**: there is no generated code and `go.mod` has no gRPC dependency.
 
 ### 4. Runtime Profiling (pprof)
-Built-in profiling hooks at `/debug/pprof/`:
+Profiling endpoints at `/debug/pprof/`:
 - CPU Profile: `http://localhost:8080/debug/pprof/profile?seconds=30`
 - Heap Memory: `http://localhost:8080/debug/pprof/heap`
-- Goroutines / Contention: `http://localhost:8080/debug/pprof/goroutine`
+- Goroutines: `http://localhost:8080/debug/pprof/goroutine`
 
 ---
 
 ## Benchmarks & Performance
 
-Evaluated on an 8-core CPU executing in single-threaded hot path mode:
+The repository includes three Go microbenchmarks and a stress program. No results are published here because they have not been recorded with hardware details or reproduced in CI; run them locally:
 
 ```bash
+# Microbenchmarks (ns/op, B/op, allocs/op)
 go test -bench=. -benchmem ./internal/engine
+
+# 1,000,000-order stress run (throughput, mean latency, heap, GC cycles)
+go run ./cmd/benchmark/main.go
 ```
 
-### Microbenchmark Results:
-
-| Benchmark Name | Operations | Latency (ns/op) | Throughput (ops/sec) | Memory Alloc | Allocs / op |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **`BenchmarkOrderBook_CrossingMatch`** | **12,951,074** | **98.39 ns** | **~10,163,000 /s** | **0 B/op** | **0 allocs/op** |
-| **`BenchmarkOrderBook_Limit_NoMatch`** | 1,000,000 | 1,042 ns | ~960,000 /s | 533 B/op | 2 allocs/op |
-| **`BenchmarkOrderBook_Cancel`** | 1,000,000 | 185 ns | ~5,400,000 /s | 0 B/op | 0 allocs/op |
-
-### 1,000,000 Order Stress Test (`cmd/benchmark/main.go`):
-```
-Total Orders Processed : 1,000,000
-Total Time Elapsed     : 125.91 ms
-Throughput (Ops/sec)   : 7,941,947.54 orders/sec
-Mean Latency per Order : 125 ns
-Heap Allocated         : 13.15 MB
-GC Pause Cycles        : 2 cycles across 1M orders
-```
+| Benchmark | What it measures |
+| :--- | :--- |
+| `BenchmarkOrderBook_CrossingMatch` | An aggressive order fully matching a resting order (hot path, intended to be allocation-free). |
+| `BenchmarkOrderBook_Limit_NoMatch` | Inserting a non-crossing limit order that rests in the book (allocates for map and level entries). |
+| `BenchmarkOrderBook_Cancel` | Cancelling a resting order by ID. |
 
 ---
 
@@ -196,33 +196,33 @@ Standard Go project layout (`golang-standards/project-layout`):
 ```
 ├── cmd/
 │   ├── engine/
-│   │   └── main.go          # Main executable server (Gateway + Engine + Recovery)
+│   │   └── main.go          # Server executable (Gateway + Engine + Recovery)
 │   └── benchmark/
-│       └── main.go          # 1M order stress benchmark executable
+│       └── main.go          # 1M order stress program
 ├── internal/
-│   ├── domain/              # Clean Domain Layer & Memory Pools
+│   ├── domain/              # Domain Layer & Memory Pools
 │   │   ├── types.go         # Price, Quantity, Side, OrderType enums
 │   │   ├── order.go         # 64-byte packed Order struct
-│   │   ├── trade.go         # Trade fill transaction entity
+│   │   ├── trade.go         # Trade fill entity
 │   │   ├── events.go        # ExecutionReport and L2 MarketDepth
-│   │   └── pool.go          # sync.Pool recyclers for zero-alloc hot path
+│   │   └── pool.go          # sync.Pool recyclers
 │   ├── engine/              # Core Matching Logic
 │   │   ├── book.go          # Limit Order Book implementation
 │   │   ├── level.go         # Intrusive doubly linked list FIFO price level
-│   │   ├── rbtree.go        # Memory-pooled Red-Black Tree for price indexing
-│   │   ├── dispatcher.go    # Sharded single-writer actor dispatcher
+│   │   ├── rbtree.go        # Pooled Red-Black Tree for price indexing
+│   │   ├── dispatcher.go    # Per-symbol single-writer dispatcher
 │   │   ├── recovery.go      # WAL replay adapter
-│   │   └── book_test.go     # Comprehensive unit tests & benchmarks
+│   │   └── book_test.go     # Unit tests & benchmarks
 │   ├── storage/wal/         # Write-Ahead Log Layer
 │   │   ├── record.go        # Binary encoding with CRC32 checksums
 │   │   ├── wal.go           # Append-only buffered writer
-│   │   └── recovery.go      # Disk log scanner and frame validation
+│   │   └── recovery.go      # Log scanner and frame validation
 │   └── api/                 # Gateway Layer
-│       └── server.go        # HTTP REST, RFC-6455 WebSocket, SSE & pprof
+│       └── server.go        # HTTP REST, RFC 6455 WebSocket, SSE & pprof
 ├── pkg/protocol/
 │   └── dto.go               # Client request/response DTOs
 ├── proto/
-│   └── engine.proto         # gRPC Protobuf service definitions
+│   └── engine.proto         # gRPC service contract (server not implemented)
 ├── go.mod
 └── README.md
 ```
@@ -236,17 +236,8 @@ Standard Go project layout (`golang-standards/project-layout`):
 go run ./cmd/engine/main.go
 ```
 
-Output:
+Log output (abridged):
 ```
-========================================================================
-   __  ___      __       __    _            ____            _            
-  /  |/  /___ _/ /______/ /_  (_)___  ____ _/ __/___  ____ _(_)___  ___  
- / /|_/ / __ '/ __/ ___/ __ \/ / __ \/ __ '/ /_/ __ \/ __ '/ / __ \/ _ \ 
-/ /  / / /_/ / /_/ /__/ / / / / / / / /_/ / __/ /_/ / /_/ / / / / /  __/ 
-/_/  /_/\__,_/\__/\___/_/ /_/_/_/ /_/\__, /_/  \____/\__, /_/_/ /_/\___/  
-                                    /____/          /____/               
-High-Performance In-Memory Limit Order Book Matching Engine (Go / HFT)
-========================================================================
 [BTC-USDT] Matching worker initialized with 64K inbound queue and binary WAL.
 [BTC-USDT] Seeded initial L2 market liquidity (Bids: 59,970-59,990 | Asks: 60,000-60,020)
 Matching Engine API & WebSocket Gateway running at http://localhost:8080
@@ -257,7 +248,7 @@ Matching Engine API & WebSocket Gateway running at http://localhost:8080
 curl "http://localhost:8080/api/v1/depth?symbol=BTC-USDT&limit=5"
 ```
 
-Response:
+Example response:
 ```json
 {
   "symbol": "BTC-USDT",
@@ -289,7 +280,7 @@ curl -X POST http://localhost:8080/api/v1/order \
   }'
 ```
 
-Response:
+Example response:
 ```json
 {
   "order_id": 1001,
@@ -311,7 +302,7 @@ Response:
 }
 ```
 
-### 4. Run the 1-Million Order Benchmark
+### 4. Run the 1-Million Order Stress Program
 ```bash
 go run ./cmd/benchmark/main.go
 ```
@@ -321,6 +312,6 @@ go run ./cmd/benchmark/main.go
 # Escape Analysis & Inlining
 go build -gcflags="-m" ./internal/domain ./internal/engine
 
-# Race Detector Verification
+# Race Detector
 go test -race -v ./internal/engine
 ```
